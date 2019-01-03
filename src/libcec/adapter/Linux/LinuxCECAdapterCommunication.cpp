@@ -97,11 +97,40 @@ bool CLinuxCECAdapterCommunication::Open(uint32_t UNUSED(iTimeoutMs), bool UNUSE
       return false;
     }
 
-    // Set logical address to unregistered, without any logical address configured no messages is transmitted or received
+    uint16_t addr;
+    if (ioctl(m_fd, CEC_ADAP_G_PHYS_ADDR, &addr))
+    {
+      LIB_CEC->AddLog(CEC_LOG_ERROR, "CLinuxCECAdapterCommunication::Open - ioctl CEC_ADAP_G_PHYS_ADDR failed - errno=%d", errno);
+      Close();
+      return false;
+    }
+
+    LIB_CEC->AddLog(CEC_LOG_DEBUG, "CLinuxCECAdapterCommunication::Open - ioctl CEC_ADAP_G_PHYS_ADDR - addr=%04x", addr);
+
+    if (addr == CEC_PHYS_ADDR_INVALID)
+    {
+      LIB_CEC->AddLog(CEC_LOG_ERROR, "CLinuxCECAdapterCommunication::Open - physical address is invalid");
+      Close();
+      return false;
+    }
+
+    // Clear existing logical addresses and set the CEC device to the unconfigured state
     struct cec_log_addrs log_addrs = {};
+    if (ioctl(m_fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs))
+    {
+      LIB_CEC->AddLog(CEC_LOG_ERROR, "CLinuxCECAdapterCommunication::Open - ioctl CEC_ADAP_S_LOG_ADDRS failed - errno=%d", errno);
+      Close();
+      return false;
+    }
+
+    LIB_CEC->AddLog(CEC_LOG_DEBUG, "CLinuxCECAdapterCommunication::Open - ioctl CEC_ADAP_S_LOG_ADDRS - log_addr_mask=%04x num_log_addrs=%u", log_addrs.log_addr_mask, log_addrs.num_log_addrs);
+
+    // Set logical address to unregistered, without any logical address configured no messages is transmitted or received
+    log_addrs = {};
     log_addrs.cec_version = CEC_OP_CEC_VERSION_1_4;
     log_addrs.vendor_id = CEC_VENDOR_PULSE_EIGHT;
     log_addrs.num_log_addrs = 1;
+    log_addrs.flags = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
     log_addrs.log_addr[0] = CEC_LOG_ADDR_UNREGISTERED;
     log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_SWITCH;
     log_addrs.log_addr_type[0] = CEC_LOG_ADDR_TYPE_UNREGISTERED;
@@ -191,6 +220,8 @@ bool CLinuxCECAdapterCommunication::SetLogicalAddresses(const cec_logical_addres
       return false;
     }
 
+    // TODO: Claiming a logical address will only work when CEC device has a valid physical address
+
     // Clear existing logical addresses and set the CEC device to the unconfigured state
     if (log_addrs.num_log_addrs)
     {
@@ -266,6 +297,10 @@ bool CLinuxCECAdapterCommunication::SetLogicalAddresses(const cec_logical_addres
     }
 
     LIB_CEC->AddLog(CEC_LOG_DEBUG, "CLinuxCECAdapterCommunication::SetLogicalAddresses - ioctl CEC_ADAP_S_LOG_ADDRS - log_addr_mask=%04x num_log_addrs=%u", log_addrs.log_addr_mask, log_addrs.num_log_addrs);
+
+    if (log_addrs.num_log_addrs && !log_addrs.log_addr_mask)
+        return false;
+
     return true;
   }
 
@@ -324,7 +359,8 @@ cec_vendor_id CLinuxCECAdapterCommunication::GetVendorId(void)
 void *CLinuxCECAdapterCommunication::Process(void)
 {
   CTimeout phys_addr_timeout;
-  bool phys_addr_invalid = false;
+  bool phys_addr_changed = false;
+  uint16_t phys_addr = CEC_INVALID_PHYSICAL_ADDRESS;
   fd_set rd_fds;
   fd_set ex_fds;
 
@@ -355,22 +391,27 @@ void *CLinuxCECAdapterCommunication::Process(void)
 
         // TODO: handle ev.state_change.log_addr_mask change
 
+        phys_addr = ev.state_change.phys_addr;
+        phys_addr_changed = true;
+
         if (ev.state_change.phys_addr == CEC_PHYS_ADDR_INVALID)
         {
-          // NOTE: Delay change to invalid physical address with 10 seconds because
-          //       EDID refresh and other events may cause short periods of invalid physical address
-          phys_addr_timeout.Init(10000);
-          phys_addr_invalid = true;
+          // Debounce change to invalid physical address with 2 seconds because
+          // EDID refresh and other events may cause short periods of invalid physical address
+          phys_addr_timeout.Init(2000);
         }
         else
         {
-          phys_addr_invalid = false;
-
-          // TODO: delay change until after log_addr_mask may have been updated
-          if (!IsStopped())
-            m_callback->HandlePhysicalAddressChanged(ev.state_change.phys_addr);
+          // Debounce change to valid physical address with 500 ms when no logical address have been claimed
+          phys_addr_timeout.Init(ev.state_change.log_addr_mask ? 0 : 500);
         }
       }
+    }
+
+    if (phys_addr_changed && !phys_addr_timeout.TimeLeft() && !IsStopped())
+    {
+      phys_addr_changed = false;
+      m_callback->HandlePhysicalAddressChanged(phys_addr);
     }
 
     if (FD_ISSET(m_fd, &rd_fds))
@@ -388,12 +429,6 @@ void *CLinuxCECAdapterCommunication::Process(void)
         if (!IsStopped())
           m_callback->OnCommandReceived(cmd);
       }
-    }
-
-    if (phys_addr_invalid && !phys_addr_timeout.TimeLeft() && !IsStopped())
-    {
-      phys_addr_invalid = false;
-      m_callback->HandlePhysicalAddressChanged(CEC_INVALID_PHYSICAL_ADDRESS);
     }
 
     if (!IsStopped())
