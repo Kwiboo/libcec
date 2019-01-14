@@ -108,11 +108,7 @@ bool CLinuxCECAdapterCommunication::Open(uint32_t UNUSED(iTimeoutMs), bool UNUSE
     LIB_CEC->AddLog(CEC_LOG_DEBUG, "CLinuxCECAdapterCommunication::Open - ioctl CEC_ADAP_G_PHYS_ADDR - addr=%04x", addr);
 
     if (addr == CEC_PHYS_ADDR_INVALID)
-    {
-      LIB_CEC->AddLog(CEC_LOG_ERROR, "CLinuxCECAdapterCommunication::Open - physical address is invalid");
-      Close();
-      return false;
-    }
+      LIB_CEC->AddLog(CEC_LOG_WARNING, "CLinuxCECAdapterCommunication::Open - physical address is invalid");
 
     // Clear existing logical addresses and set the CEC device to the unconfigured state
     struct cec_log_addrs log_addrs = {};
